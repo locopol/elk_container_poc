@@ -1,0 +1,15 @@
+# Docker volumes / Elasticsearch data directories (generated at runtime)
+config/**
+
+# Log files from test runs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo

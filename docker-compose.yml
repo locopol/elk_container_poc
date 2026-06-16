@@ -1,0 +1,280 @@
+# =============================================================================
+# Piloto Elasticsearch - Docker Compose
+# Cluster multi-nodo con seguridad, monitoreo y Kibana
+# Version: 8.19.x
+# Nota: Se omite el campo `version` ya que Docker Compose v2+ lo ignora
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # SERVICIO DE CONFIGURACION INICIAL (genera certificados y credenciales)
+  # ---------------------------------------------------------------------------
+  # Este servicio se ejecuta una sola vez al inicio para:
+  #   1. Generar la Certificate Authority (CA) auto-firmada
+  #   2. Generar los certificados para cada nodo del cluster
+  #   3. Configurar la password del usuario kibana_system en Elasticsearch
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    volumes:
+      - ${DATA_DIR_BASE}/${CERTS_DIR}:/usr/share/elasticsearch/config/certs
+    user: "0"
+    command: >
+      bash -c '
+        if [ x${ELASTIC_PASSWORD} == x ]; then
+          echo "Set the ELASTIC_PASSWORD environment variable in the .env file";
+          exit 1;
+        elif [ x${KIBANA_PASSWORD} == x ]; then
+          echo "Set the KIBANA_PASSWORD environment variable in the .env file";
+          exit 1;
+        fi;
+
+        # Crear CA si no existe
+        if [ ! -f config/certs/ca.zip ]; then
+          echo "Creating CA";
+          bin/elasticsearch-certutil ca --silent --pem -out config/certs/ca.zip;
+          unzip config/certs/ca.zip -d config/certs;
+        fi;
+
+        # Crear certificados de nodo si no existen
+        if [ ! -f config/certs/certs.zip ]; then
+          echo "Creating certs";
+          echo -e \
+          "instances:\n" \
+          "  - name: es01\n" \
+          "    dns:\n" \
+          "      - es01\n" \
+          "      - localhost\n" \
+          "    ip:\n" \
+          "      - 127.0.0.1\n" \
+          "  - name: es02\n" \
+          "    dns:\n" \
+          "      - es02\n" \
+          "      - localhost\n" \
+          "    ip:\n" \
+          "      - 127.0.0.1\n" \
+          "  - name: es03\n" \
+          "    dns:\n" \
+          "      - es03\n" \
+          "      - localhost\n" \
+          "    ip:\n" \
+          "      - 127.0.0.1\n" \
+            > config/certs/instances.yml;
+          bin/elasticsearch-certutil cert --silent --pem \
+            -out config/certs/certs.zip \
+            --in config/certs/instances.yml \
+            --ca-cert config/certs/ca/ca.crt \
+            --ca-key config/certs/ca/ca.key;
+          unzip config/certs/certs.zip -d config/certs;
+        fi;
+
+        # Ajustar permisos de archivos de certificados
+        echo "Setting file permissions";
+        chown -R root:root config/certs;
+        find . -type d -exec chmod 750 {} \;;
+        find . -type f -exec chmod 640 {} \;;
+
+        # Esperar a que es01 este disponible
+        echo "Waiting for Elasticsearch availability";
+        until curl -s --cacert config/certs/ca/ca.crt https://es01:9200 \
+          | grep -q "missing authentication credentials"; do
+          sleep 30;
+        done;
+
+        # Configurar password de kibana_system
+        echo "Setting kibana_system password";
+        until curl -s -X POST --cacert config/certs/ca/ca.crt \
+          -u "elastic:${ELASTIC_PASSWORD}" \
+          -H "Content-Type: application/json" \
+          https://es01:9200/_security/user/kibana_system/_password \
+          -d "{\"password\":\"${KIBANA_PASSWORD}\"}" \
+          | grep -q "^{}"; do
+          sleep 10;
+        done;
+
+        echo "All done!";
+      '
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f config/certs/es01/es01.crt ]"]
+      interval: 1s
+      timeout: 5s
+      retries: 120
+
+  # ---------------------------------------------------------------------------
+  # NODO 1 DE ELASTICSEARCH (master-eligible + data)
+  # ---------------------------------------------------------------------------
+  es01:
+    depends_on:
+      setup:
+        condition: service_healthy
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: es01
+    volumes:
+      - ${DATA_DIR_BASE}/${CERTS_DIR}:/usr/share/elasticsearch/config/certs
+      - ${DATA_DIR_BASE}/${ES01_DATA_DIR}:/usr/share/elasticsearch/data
+    ports:
+      - ${ES_HOST}:${ES_PORT}:9200
+      - ${ES_HOST}:9300:9300
+    environment:
+      - node.name=es01
+      - cluster.name=${CLUSTER_NAME}
+      - cluster.initial_master_nodes=es01,es02,es03
+      - discovery.seed_hosts=es02,es03
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      # Security HTTP (TLS)
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/es01/es01.key
+      - xpack.security.http.ssl.certificate=certs/es01/es01.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      # Security Transport (TLS entre nodos)
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/es01/es01.key
+      - xpack.security.transport.ssl.certificate=certs/es01/es01.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      # Monitoreo X-Pack (siempre habilitado con licencia con ES 8.x)
+      # Licencia
+      - xpack.license.self_generated.type=${LICENSE}
+      # Machine Learning
+      - xpack.ml.use_auto_machine_memory_percent=true
+    mem_limit: ${MEM_LIMIT}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'"]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+
+  # ---------------------------------------------------------------------------
+  # NODO 2 DE ELASTICSEARCH (master-eligible + data)
+  # ---------------------------------------------------------------------------
+  es02:
+    depends_on:
+      es01:
+        condition: service_healthy
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: es02
+    volumes:
+      - ${DATA_DIR_BASE}/${CERTS_DIR}:/usr/share/elasticsearch/config/certs
+      - ${DATA_DIR_BASE}/${ES02_DATA_DIR}:/usr/share/elasticsearch/data
+    ports:
+      - ${ES_HOST_2}:${ES_PORT_2}:9200
+      - ${ES_HOST_2}:9301:9301
+    environment:
+      - node.name=es02
+      - cluster.name=${CLUSTER_NAME}
+      - cluster.initial_master_nodes=es01,es02,es03
+      - discovery.seed_hosts=es01,es03
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      # Security HTTP (TLS)
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/es02/es02.key
+      - xpack.security.http.ssl.certificate=certs/es02/es02.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      # Security Transport (TLS entre nodos)
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/es02/es02.key
+      - xpack.security.transport.ssl.certificate=certs/es02/es02.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      # Monitoreo X-Pack (siempre habilitado con licencia con ES 8.x)
+      # Licencia
+      - xpack.license.self_generated.type=${LICENSE}
+      # Machine Learning
+      - xpack.ml.use_auto_machine_memory_percent=true
+    mem_limit: ${MEM_LIMIT}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'"]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+
+  # ---------------------------------------------------------------------------
+  # NODO 3 DE ELASTICSEARCH (master-eligible + data)
+  # ---------------------------------------------------------------------------
+  es03:
+    depends_on:
+      es02:
+        condition: service_healthy
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: es03
+    volumes:
+      - ${DATA_DIR_BASE}/${CERTS_DIR}:/usr/share/elasticsearch/config/certs
+      - ${DATA_DIR_BASE}/${ES03_DATA_DIR}:/usr/share/elasticsearch/data
+    ports:
+      - ${ES_HOST_3}:${ES_PORT_3}:9200
+      - ${ES_HOST_3}:9302:9302
+    environment:
+      - node.name=es03
+      - cluster.name=${CLUSTER_NAME}
+      - cluster.initial_master_nodes=es01,es02,es03
+      - discovery.seed_hosts=es01,es02
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      # Security HTTP (TLS)
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/es03/es03.key
+      - xpack.security.http.ssl.certificate=certs/es03/es03.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      # Security Transport (TLS entre nodos)
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/es03/es03.key
+      - xpack.security.transport.ssl.certificate=certs/es03/es03.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      # Monitoreo X-Pack (siempre habilitado con licencia con ES 8.x)
+      # Licencia
+      - xpack.license.self_generated.type=${LICENSE}
+      # Machine Learning
+      - xpack.ml.use_auto_machine_memory_percent=true
+    mem_limit: ${MEM_LIMIT}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'"]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+
+  # ---------------------------------------------------------------------------
+  # KIBANA (consola de administracion)
+  # ---------------------------------------------------------------------------
+  kibana:
+    depends_on:
+      es01:
+        condition: service_healthy
+      es02:
+        condition: service_healthy
+      es03:
+        condition: service_healthy
+    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
+    container_name: kibana
+    volumes:
+      - ${DATA_DIR_BASE}/${CERTS_DIR}:/usr/share/kibana/config/certs
+      - ${DATA_DIR_BASE}/${KIBANA_DATA_DIR}:/usr/share/kibana/data
+    ports:
+      - ${KIBANA_HOST}:${KIBANA_PORT}:5601
+    environment:
+      - SERVERNAME=kibana
+      - ELASTICSEARCH_HOSTS=https://es01:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
+    mem_limit: ${MEM_LIMIT}
+
+# =============================================================================
+# VOLUMES (persistencia de datos con bind mounts configurables)
+# =============================================================================
+# Los volumes nombrados se usan para certificados compartidos entre servicios.
+# Los datos de cada nodo usan bind mounts en rutas configurables via .env.
+
+volumes:
+  certs:
+    driver: local
+  esdata01:
+    driver: local
+  esdata02:
+    driver: local
+  esdata03:
+    driver: local
+  kibanadata:
+    driver: local
